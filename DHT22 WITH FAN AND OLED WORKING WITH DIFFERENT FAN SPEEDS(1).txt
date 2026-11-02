@@ -1,0 +1,593 @@
+#include "main.h"
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+#define OLED_ADDR       (0x3C << 1)
+#define DHT22_PORT      GPIOB
+#define DHT22_PIN       GPIO_PIN_14
+
+#define FAN_PORT        GPIOB
+#define FAN_PIN         GPIO_PIN_4
+
+#define TEMP_LIMIT      250U   /* 25.0 C */
+#define HUM_LIMIT       800U   /* 80.0 % */
+
+/* PWM: 1 kHz, duty values from 0 to 1000 */
+#define FAN_OFF         0U
+#define FAN_LOW         350U
+#define FAN_MEDIUM      650U
+#define FAN_HIGH        1000U
+
+I2C_HandleTypeDef hi2c1;
+TIM_HandleTypeDef htim3;
+
+/* Function declarations */
+void SystemClock_Config(void);
+void Error_Handler(void);
+
+static void MX_GPIO_Init(void);
+static void MX_I2C1_Init(void);
+static void MX_TIM3_Init(void);
+
+static void OLED_Command(uint8_t cmd);
+static void OLED_Data(uint8_t data);
+static void OLED_Init(void);
+static void OLED_SetPosition(uint8_t page, uint8_t col);
+static void OLED_Clear(void);
+static void OLED_Char(char c);
+static void OLED_String(const char *str);
+
+static void DHT22_Init(void);
+static void DHT22_DelayUs(uint32_t us);
+static void DHT22_SetInput(void);
+static void DHT22_SetOutput(void);
+static uint8_t DHT22_WaitLevel(GPIO_PinState level,
+                               uint32_t timeout_us);
+static uint8_t DHT22_ReadByte(uint8_t *value);
+static uint8_t DHT22_Read(int16_t *temperature,
+                          uint16_t *humidity);
+
+static void Fan_SetSpeed(uint16_t duty);
+
+/* =========================================================
+   OLED FONT: ASCII 32 THROUGH 90
+   ========================================================= */
+
+static const uint8_t font5x7[][5] = {
+    {0,0,0,0,0}, {0,0,0x5F,0,0}, {0,0x07,0,0x07,0},
+    {0x14,0x7F,0x14,0x7F,0x14},
+    {0x24,0x2A,0x7F,0x2A,0x12},
+    {0x23,0x13,0x08,0x64,0x62},
+    {0x36,0x49,0x55,0x22,0x50},
+    {0,0x05,0x03,0,0}, {0,0x1C,0x22,0x41,0},
+    {0,0x41,0x22,0x1C,0}, {0x14,0x08,0x3E,0x08,0x14},
+    {0x08,0x08,0x3E,0x08,0x08}, {0,0x50,0x30,0,0},
+    {0x08,0x08,0x08,0x08,0}, {0,0x60,0x60,0,0},
+    {0x20,0x10,0x08,0x04,0x02},
+    {0x3E,0x51,0x49,0x45,0x3E},
+    {0,0x42,0x7F,0x40,0},
+    {0x42,0x61,0x51,0x49,0x46},
+    {0x21,0x41,0x45,0x4B,0x31},
+    {0x18,0x14,0x12,0x7F,0x10},
+    {0x27,0x45,0x45,0x45,0x39},
+    {0x3C,0x4A,0x49,0x49,0x30},
+    {0x01,0x71,0x09,0x05,0x03},
+    {0x36,0x49,0x49,0x49,0x36},
+    {0x06,0x49,0x49,0x29,0x1E},
+    {0,0x36,0x36,0,0}, {0,0x56,0x36,0,0},
+    {0x08,0x14,0x22,0x41,0}, {0x14,0x14,0x14,0x14,0x14},
+    {0,0x41,0x22,0x14,0x08},
+    {0x02,0x01,0x51,0x09,0x06},
+    {0x32,0x49,0x79,0x41,0x3E},
+    {0x7E,0x11,0x11,0x11,0x7E},
+    {0x7F,0x49,0x49,0x49,0x36},
+    {0x3E,0x41,0x41,0x41,0x22},
+    {0x7F,0x41,0x41,0x22,0x1C},
+    {0x7F,0x49,0x49,0x49,0x41},
+    {0x7F,0x09,0x09,0x09,0x01},
+    {0x3E,0x41,0x49,0x49,0x7A},
+    {0x7F,0x08,0x08,0x08,0x7F},
+    {0,0x41,0x7F,0x41,0},
+    {0x20,0x40,0x41,0x3F,0x01},
+    {0x7F,0x08,0x14,0x22,0x41},
+    {0x7F,0x40,0x40,0x40,0x40},
+    {0x7F,0x02,0x0C,0x02,0x7F},
+    {0x7F,0x04,0x08,0x10,0x7F},
+    {0x3E,0x41,0x41,0x41,0x3E},
+    {0x7F,0x09,0x09,0x09,0x06},
+    {0x3E,0x41,0x51,0x21,0x5E},
+    {0x7F,0x09,0x19,0x29,0x46},
+    {0x46,0x49,0x49,0x49,0x31},
+    {0x01,0x01,0x7F,0x01,0x01},
+    {0x3F,0x40,0x40,0x40,0x3F},
+    {0x1F,0x20,0x40,0x20,0x1F},
+    {0x3F,0x40,0x38,0x40,0x3F},
+    {0x63,0x14,0x08,0x14,0x63},
+    {0x07,0x08,0x70,0x08,0x07},
+    {0x61,0x51,0x49,0x45,0x43}
+};
+
+/* =========================================================
+   OLED DRIVER
+   ========================================================= */
+
+static void OLED_Command(uint8_t cmd)
+{
+    uint8_t buf[2] = {0x00, cmd};
+    HAL_I2C_Master_Transmit(&hi2c1, OLED_ADDR, buf, 2, 100);
+}
+
+static void OLED_Data(uint8_t data)
+{
+    uint8_t buf[2] = {0x40, data};
+    HAL_I2C_Master_Transmit(&hi2c1, OLED_ADDR, buf, 2, 100);
+}
+
+static void OLED_Init(void)
+{
+    HAL_Delay(100);
+
+    OLED_Command(0xAE);
+    OLED_Command(0xD5); OLED_Command(0x80);
+    OLED_Command(0xA8); OLED_Command(0x3F);
+    OLED_Command(0xD3); OLED_Command(0x00);
+    OLED_Command(0x40);
+    OLED_Command(0xAD); OLED_Command(0x8B);
+    OLED_Command(0xA1);
+    OLED_Command(0xC8);
+    OLED_Command(0xDA); OLED_Command(0x12);
+    OLED_Command(0x81); OLED_Command(0x7F);
+    OLED_Command(0xD9); OLED_Command(0x22);
+    OLED_Command(0xDB); OLED_Command(0x35);
+    OLED_Command(0xA4);
+    OLED_Command(0xA6);
+    OLED_Command(0xAF);
+}
+
+static void OLED_SetPosition(uint8_t page, uint8_t col)
+{
+    col += 2;
+    OLED_Command(0xB0 | page);
+    OLED_Command(0x10 | (col >> 4));
+    OLED_Command(0x00 | (col & 0x0F));
+}
+
+static void OLED_Clear(void)
+{
+    for (uint8_t page = 0; page < 8; page++)
+    {
+        OLED_SetPosition(page, 0);
+        for (uint8_t col = 0; col < 128; col++)
+            OLED_Data(0x00);
+    }
+}
+
+static void OLED_Char(char c)
+{
+    if (c >= 'a' && c <= 'z')
+        c -= ('a' - 'A');
+
+    if (c < 32 || c > 90)
+        c = ' ';
+
+    uint8_t index = (uint8_t)c - 32;
+
+    for (uint8_t i = 0; i < 5; i++)
+        OLED_Data(font5x7[index][i]);
+
+    OLED_Data(0x00);
+}
+
+static void OLED_String(const char *str)
+{
+    while (*str != '\0')
+        OLED_Char(*str++);
+}
+
+/* =========================================================
+   DHT22 DRIVER
+   Temperature: tenths of degrees C
+   Humidity: tenths of percent RH
+   ========================================================= */
+
+static void DHT22_DelayUs(uint32_t us)
+{
+    uint32_t start = DWT->CYCCNT;
+    uint32_t cycles = (SystemCoreClock / 1000000U) * us;
+
+    while ((uint32_t)(DWT->CYCCNT - start) < cycles)
+    {
+    }
+}
+
+static void DHT22_SetInput(void)
+{
+    GPIO_InitTypeDef gpio = {0};
+    gpio.Pin = DHT22_PIN;
+    gpio.Mode = GPIO_MODE_INPUT;
+    gpio.Pull = GPIO_PULLUP;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(DHT22_PORT, &gpio);
+}
+
+static void DHT22_SetOutput(void)
+{
+    GPIO_InitTypeDef gpio = {0};
+    gpio.Pin = DHT22_PIN;
+    gpio.Mode = GPIO_MODE_OUTPUT_OD;
+    gpio.Pull = GPIO_PULLUP;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(DHT22_PORT, &gpio);
+}
+
+static void DHT22_Init(void)
+{
+    GPIO_InitTypeDef gpio = {0};
+
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
+    gpio.Pin = DHT22_PIN;
+    gpio.Mode = GPIO_MODE_OUTPUT_OD;
+    gpio.Pull = GPIO_PULLUP;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(DHT22_PORT, &gpio);
+
+    HAL_GPIO_WritePin(DHT22_PORT, DHT22_PIN, GPIO_PIN_SET);
+}
+
+static uint8_t DHT22_WaitLevel(GPIO_PinState level,
+                               uint32_t timeout_us)
+{
+    uint32_t start = DWT->CYCCNT;
+    uint32_t timeout_cycles =
+        (SystemCoreClock / 1000000U) * timeout_us;
+
+    while (HAL_GPIO_ReadPin(DHT22_PORT, DHT22_PIN) != level)
+    {
+        if ((uint32_t)(DWT->CYCCNT - start) >= timeout_cycles)
+            return 0;
+    }
+
+    return 1;
+}
+
+static uint8_t DHT22_ReadByte(uint8_t *value)
+{
+    uint8_t result = 0;
+
+    for (uint8_t i = 0; i < 8; i++)
+    {
+        if (!DHT22_WaitLevel(GPIO_PIN_RESET, 100))
+            return 0;
+
+        if (!DHT22_WaitLevel(GPIO_PIN_SET, 100))
+            return 0;
+
+        DHT22_DelayUs(40);
+        result <<= 1;
+
+        if (HAL_GPIO_ReadPin(DHT22_PORT, DHT22_PIN)
+            == GPIO_PIN_SET)
+        {
+            result |= 1;
+        }
+    }
+
+    *value = result;
+    return 1;
+}
+
+static uint8_t DHT22_Read(int16_t *temperature,
+                          uint16_t *humidity)
+{
+    uint8_t data[5] = {0};
+
+    DHT22_SetOutput();
+    HAL_GPIO_WritePin(DHT22_PORT, DHT22_PIN, GPIO_PIN_RESET);
+    HAL_Delay(2);
+
+    HAL_GPIO_WritePin(DHT22_PORT, DHT22_PIN, GPIO_PIN_SET);
+    DHT22_DelayUs(30);
+    DHT22_SetInput();
+
+    if (!DHT22_WaitLevel(GPIO_PIN_RESET, 100))
+        return 0;
+
+    if (!DHT22_WaitLevel(GPIO_PIN_SET, 100))
+        return 0;
+
+    if (!DHT22_WaitLevel(GPIO_PIN_RESET, 100))
+        return 0;
+
+    for (uint8_t i = 0; i < 5; i++)
+    {
+        if (!DHT22_ReadByte(&data[i]))
+            return 0;
+    }
+
+    if ((uint8_t)(data[0] + data[1] + data[2] + data[3])
+        != data[4])
+    {
+        return 0;
+    }
+
+    *humidity = ((uint16_t)data[0] << 8) | data[1];
+
+    uint16_t rawTemperature =
+        ((uint16_t)(data[2] & 0x7F) << 8) | data[3];
+
+    if (data[2] & 0x80)
+        *temperature = -(int16_t)rawTemperature;
+    else
+        *temperature = (int16_t)rawTemperature;
+
+    return 1;
+}
+
+/* =========================================================
+   FAN PWM: PB4 = TIM3_CH1
+   Clock = 16 MHz; prescaler = 15; ARR = 999
+   PWM frequency = 1 kHz
+   ========================================================= */
+
+static void MX_TIM3_Init(void)
+{
+    TIM_OC_InitTypeDef sConfigOC = {0};
+    GPIO_InitTypeDef gpio = {0};
+
+    __HAL_RCC_TIM3_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    gpio.Pin = FAN_PIN;
+    gpio.Mode = GPIO_MODE_AF_PP;
+    gpio.Pull = GPIO_NOPULL;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    gpio.Alternate = GPIO_AF2_TIM3;
+    HAL_GPIO_Init(FAN_PORT, &gpio);
+
+    htim3.Instance = TIM3;
+    htim3.Init.Prescaler = 15;
+    htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+    htim3.Init.Period = 999;
+    htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+    htim3.Init.AutoReloadPreload =
+        TIM_AUTORELOAD_PRELOAD_DISABLE;
+
+    if (HAL_TIM_PWM_Init(&htim3) != HAL_OK)
+        Error_Handler();
+
+    sConfigOC.OCMode = TIM_OCMODE_PWM1;
+    sConfigOC.Pulse = FAN_OFF;
+    sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+    sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+
+    if (HAL_TIM_PWM_ConfigChannel(
+            &htim3, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+        Error_Handler();
+
+    if (HAL_TIM_PWM_Start(
+            &htim3, TIM_CHANNEL_1) != HAL_OK)
+        Error_Handler();
+
+    Fan_SetSpeed(FAN_OFF);
+}
+
+static void Fan_SetSpeed(uint16_t duty)
+{
+    if (duty > 1000U)
+        duty = 1000U;
+
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, duty);
+}
+
+/* =========================================================
+   MAIN APPLICATION
+   ========================================================= */
+
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+
+    MX_GPIO_Init();
+    MX_I2C1_Init();
+    MX_TIM3_Init();
+
+    DHT22_Init();
+    OLED_Init();
+    OLED_Clear();
+
+    OLED_SetPosition(2, 10);
+    OLED_String("DHT22 SENSOR");
+    HAL_Delay(2000);
+
+    while (1)
+    {
+        int16_t temperature = 0;
+        uint16_t humidity = 0;
+        char line[22];
+        const char *fanLabel = "FAN: OFF";
+        uint16_t fanDuty = FAN_OFF;
+
+        if (DHT22_Read(&temperature, &humidity))
+        {
+            int tempAbs = (temperature < 0)
+                          ? -temperature : temperature;
+
+            /*
+             * Control policy:
+             * Fan OFF if temperature < 25.0 C OR
+             * humidity < 80.0%.
+             *
+             * LOW:    >= 25.0 C AND >= 80.0%
+             * MEDIUM: >= 28.0 C AND >= 85.0%
+             * HIGH:   >= 31.0 C AND >= 90.0%
+             */
+
+            if (temperature < (int16_t)TEMP_LIMIT ||
+                humidity < HUM_LIMIT)
+            {
+                fanDuty = FAN_OFF;
+                fanLabel = "FAN: OFF";
+            }
+            else if (temperature >= 310 && humidity >= 900)
+            {
+                fanDuty = FAN_HIGH;
+                fanLabel = "FAN: HIGH";
+            }
+            else if (temperature >= 280 && humidity >= 850)
+            {
+                fanDuty = FAN_MEDIUM;
+                fanLabel = "FAN: MED";
+            }
+            else
+            {
+                fanDuty = FAN_LOW;
+                fanLabel = "FAN: LOW";
+            }
+
+            Fan_SetSpeed(fanDuty);
+
+            OLED_Clear();
+
+            OLED_SetPosition(1, 5);
+            OLED_String("DHT22 READINGS");
+
+            OLED_SetPosition(3, 0);
+            snprintf(line, sizeof(line),
+                     "TEMP:%s%d.%d C",
+                     (temperature < 0) ? "-" : "",
+                     tempAbs / 10, tempAbs % 10);
+            OLED_String(line);
+
+            OLED_SetPosition(5, 0);
+            snprintf(line, sizeof(line),
+                     "HUM:%d.%d %%",
+                     humidity / 10, humidity % 10);
+            OLED_String(line);
+
+            OLED_SetPosition(7, 0);
+            OLED_String(fanLabel);
+        }
+        else
+        {
+            /* Fail safe: turn fan off on sensor error */
+            Fan_SetSpeed(FAN_OFF);
+
+            OLED_Clear();
+
+            OLED_SetPosition(2, 5);
+            OLED_String("DHT22 ERROR");
+
+            OLED_SetPosition(4, 0);
+            OLED_String("CHECK DATA WIRE");
+
+            OLED_SetPosition(7, 0);
+            OLED_String("FAN: OFF");
+        }
+
+        /* DHT22 should not be polled faster than ~2 seconds */
+        HAL_Delay(2500);
+    }
+}
+
+/* =========================================================
+   CLOCK CONFIGURATION
+   HSI = 16 MHz, PLL disabled
+   ========================================================= */
+
+void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef osc = {0};
+    RCC_ClkInitTypeDef clk = {0};
+
+    __HAL_RCC_PWR_CLK_ENABLE();
+    __HAL_PWR_VOLTAGESCALING_CONFIG(
+        PWR_REGULATOR_VOLTAGE_SCALE2);
+
+    osc.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+    osc.HSIState = RCC_HSI_ON;
+    osc.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+    osc.PLL.PLLState = RCC_PLL_NONE;
+
+    if (HAL_RCC_OscConfig(&osc) != HAL_OK)
+        Error_Handler();
+
+    clk.ClockType = RCC_CLOCKTYPE_HCLK |
+                    RCC_CLOCKTYPE_SYSCLK |
+                    RCC_CLOCKTYPE_PCLK1 |
+                    RCC_CLOCKTYPE_PCLK2;
+
+    clk.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+    clk.AHBCLKDivider = RCC_SYSCLK_DIV1;
+    clk.APB1CLKDivider = RCC_HCLK_DIV1;
+    clk.APB2CLKDivider = RCC_HCLK_DIV1;
+
+    if (HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_0) != HAL_OK)
+        Error_Handler();
+
+    SystemCoreClockUpdate();
+}
+
+/* =========================================================
+   GPIO CONFIGURATION
+   OLED: PB6 = I2C1_SCL, PB7 = I2C1_SDA
+   DHT22 PB14 is configured by DHT22_Init()
+   PB4 is configured for PWM by MX_TIM3_Init()
+   ========================================================= */
+
+static void MX_GPIO_Init(void)
+{
+    GPIO_InitTypeDef gpio = {0};
+
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    gpio.Pin = GPIO_PIN_6 | GPIO_PIN_7;
+    gpio.Mode = GPIO_MODE_AF_OD;
+    gpio.Pull = GPIO_PULLUP;
+    gpio.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    gpio.Alternate = GPIO_AF4_I2C1;
+
+    HAL_GPIO_Init(GPIOB, &gpio);
+}
+
+/* =========================================================
+   I2C1 CONFIGURATION
+   ========================================================= */
+
+static void MX_I2C1_Init(void)
+{
+    __HAL_RCC_I2C1_CLK_ENABLE();
+
+    hi2c1.Instance = I2C1;
+    hi2c1.Init.ClockSpeed = 100000;
+    hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+    hi2c1.Init.OwnAddress1 = 0;
+    hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+    hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+    hi2c1.Init.OwnAddress2 = 0;
+    hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+    hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+
+    if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+        Error_Handler();
+}
+
+/* =========================================================
+   ERROR HANDLER
+   ========================================================= */
+
+void Error_Handler(void)
+{
+    __disable_irq();
+
+    while (1)
+    {
+    }
+}
+

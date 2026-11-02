@@ -1,0 +1,483 @@
+#include "main.h"
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+/* =========================================================
+   STM32F411CEU6 - MQ-2 + OLED + PASSIVE BUZZER
+
+   OLED       : SH1106-compatible I2C1, PB6/PB7, address 0x3C
+   MQ-2 AO    : PA0 / ADC1_IN0 through voltage divider
+   Buzzer SIG : PB9
+   Buzzer VCC : 5 V rated module supply
+   Buzzer GND : STM32 GND (common ground)
+
+   MQ2_THRESHOLD = 300 ADC counts (experimental)
+   ========================================================= */
+
+#define OLED_ADDR       (0x3C << 1)
+#define MQ2_THRESHOLD   300U
+
+#define BUZZER_PORT     GPIOB
+#define BUZZER_PIN      GPIO_PIN_9
+
+I2C_HandleTypeDef hi2c1;
+ADC_HandleTypeDef hadc1;
+
+void SystemClock_Config(void);
+void Error_Handler(void);
+
+static void MX_GPIO_Init(void);
+static void MX_I2C1_Init(void);
+static void MX_ADC1_Init(void);
+
+static uint16_t MQ2_ReadADC(void);
+static void Buzzer_Tone(uint8_t enable);
+
+static void OLED_Command(uint8_t cmd);
+static void OLED_Data(uint8_t data);
+static void OLED_Init(void);
+static void OLED_SetPosition(uint8_t page, uint8_t col);
+static void OLED_Clear(void);
+static void OLED_Char(char c);
+static void OLED_String(const char *str);
+
+/* =========================================================
+   OLED FONT: ASCII 32 THROUGH 90
+   ========================================================= */
+
+static const uint8_t font5x7[][5] = {
+    {0,0,0,0,0},
+    {0,0,0x5F,0,0},
+    {0,0x07,0,0x07,0},
+    {0x14,0x7F,0x14,0x7F,0x14},
+    {0x24,0x2A,0x7F,0x2A,0x12},
+    {0x23,0x13,0x08,0x64,0x62},
+    {0x36,0x49,0x55,0x22,0x50},
+    {0,0x05,0x03,0,0},
+    {0,0x1C,0x22,0x41,0},
+    {0,0x41,0x22,0x1C,0},
+    {0x14,0x08,0x3E,0x08,0x14},
+    {0x08,0x08,0x3E,0x08,0x08},
+    {0,0x50,0x30,0,0},
+    {0x08,0x08,0x08,0x08,0x08},
+    {0,0x60,0x60,0,0},
+    {0x20,0x10,0x08,0x04,0x02},
+    {0x3E,0x51,0x49,0x45,0x3E},
+    {0,0x42,0x7F,0x40,0},
+    {0x42,0x61,0x51,0x49,0x46},
+    {0x21,0x41,0x45,0x4B,0x31},
+    {0x18,0x14,0x12,0x7F,0x10},
+    {0x27,0x45,0x45,0x45,0x39},
+    {0x3C,0x4A,0x49,0x49,0x30},
+    {0x01,0x71,0x09,0x05,0x03},
+    {0x36,0x49,0x49,0x49,0x36},
+    {0x06,0x49,0x49,0x29,0x1E},
+    {0,0x36,0x36,0,0},
+    {0,0x56,0x36,0,0},
+    {0x08,0x14,0x22,0x41,0},
+    {0x14,0x14,0x14,0x14,0x14},
+    {0,0x41,0x22,0x14,0x08},
+    {0x02,0x01,0x51,0x09,0x06},
+    {0x32,0x49,0x79,0x41,0x3E},
+    {0x7E,0x11,0x11,0x11,0x7E},
+    {0x7F,0x49,0x49,0x49,0x36},
+    {0x3E,0x41,0x41,0x41,0x22},
+    {0x7F,0x41,0x41,0x22,0x1C},
+    {0x7F,0x49,0x49,0x49,0x41},
+    {0x7F,0x09,0x09,0x09,0x01},
+    {0x3E,0x41,0x49,0x49,0x7A},
+    {0x7F,0x08,0x08,0x08,0x7F},
+    {0,0x41,0x7F,0x41,0},
+    {0x20,0x40,0x41,0x3F,0x01},
+    {0x7F,0x08,0x14,0x22,0x41},
+    {0x7F,0x40,0x40,0x40,0x40},
+    {0x7F,0x02,0x0C,0x02,0x7F},
+    {0x7F,0x04,0x08,0x10,0x7F},
+    {0x3E,0x41,0x41,0x41,0x3E},
+    {0x7F,0x09,0x09,0x09,0x06},
+    {0x3E,0x41,0x51,0x21,0x5E},
+    {0x7F,0x09,0x19,0x29,0x46},
+    {0x46,0x49,0x49,0x49,0x31},
+    {0x01,0x01,0x7F,0x01,0x01},
+    {0x3F,0x40,0x40,0x40,0x3F},
+    {0x1F,0x20,0x40,0x20,0x1F},
+    {0x3F,0x40,0x38,0x40,0x3F},
+    {0x63,0x14,0x08,0x14,0x63},
+    {0x07,0x08,0x70,0x08,0x07},
+    {0x61,0x51,0x49,0x45,0x43}
+};
+
+/* =========================================================
+   OLED DRIVER
+   ========================================================= */
+
+static void OLED_Command(uint8_t cmd)
+{
+    uint8_t buf[2] = {0x00, cmd};
+
+    HAL_I2C_Master_Transmit(
+        &hi2c1, OLED_ADDR, buf, 2, 100
+    );
+}
+
+static void OLED_Data(uint8_t data)
+{
+    uint8_t buf[2] = {0x40, data};
+
+    HAL_I2C_Master_Transmit(
+        &hi2c1, OLED_ADDR, buf, 2, 100
+    );
+}
+
+static void OLED_Init(void)
+{
+    HAL_Delay(100);
+
+    OLED_Command(0xAE);
+    OLED_Command(0xD5); OLED_Command(0x80);
+    OLED_Command(0xA8); OLED_Command(0x3F);
+    OLED_Command(0xD3); OLED_Command(0x00);
+    OLED_Command(0x40);
+    OLED_Command(0xAD); OLED_Command(0x8B);
+    OLED_Command(0xA1);
+    OLED_Command(0xC8);
+    OLED_Command(0xDA); OLED_Command(0x12);
+    OLED_Command(0x81); OLED_Command(0x7F);
+    OLED_Command(0xD9); OLED_Command(0x22);
+    OLED_Command(0xDB); OLED_Command(0x35);
+    OLED_Command(0xA4);
+    OLED_Command(0xA6);
+    OLED_Command(0xAF);
+}
+
+static void OLED_SetPosition(uint8_t page, uint8_t col)
+{
+    col += 2;
+
+    OLED_Command(0xB0 | page);
+    OLED_Command(0x10 | (col >> 4));
+    OLED_Command(0x00 | (col & 0x0F));
+}
+
+static void OLED_Clear(void)
+{
+    for (uint8_t page = 0; page < 8; page++)
+    {
+        OLED_SetPosition(page, 0);
+
+        for (uint8_t col = 0; col < 128; col++)
+        {
+            OLED_Data(0x00);
+        }
+    }
+}
+
+static void OLED_Char(char c)
+{
+    if (c >= 'a' && c <= 'z')
+    {
+        c -= ('a' - 'A');
+    }
+
+    if (c < 32 || c > 90)
+    {
+        c = ' ';
+    }
+
+    uint8_t index = (uint8_t)c - 32;
+
+    for (uint8_t i = 0; i < 5; i++)
+    {
+        OLED_Data(font5x7[index][i]);
+    }
+
+    OLED_Data(0x00);
+}
+
+static void OLED_String(const char *str)
+{
+    while (*str != '\0')
+    {
+        OLED_Char(*str++);
+    }
+}
+
+/* =========================================================
+   MQ-2 ADC READING
+   ========================================================= */
+
+static uint16_t MQ2_ReadADC(void)
+{
+    if (HAL_ADC_Start(&hadc1) != HAL_OK)
+    {
+        return 0;
+    }
+
+    if (HAL_ADC_PollForConversion(&hadc1, 20) != HAL_OK)
+    {
+        HAL_ADC_Stop(&hadc1);
+        return 0;
+    }
+
+    uint16_t value = (uint16_t)HAL_ADC_GetValue(&hadc1);
+
+    HAL_ADC_Stop(&hadc1);
+
+    return value;
+}
+
+/* =========================================================
+   PASSIVE BUZZER TONE ON PB9
+   Approximately 500 Hz, generated by software toggling.
+   enable=1: generate a short tone
+   enable=0: hold signal low
+   ========================================================= */
+
+static void Buzzer_Tone(uint8_t enable)
+{
+    if (enable)
+    {
+        /* 100 cycles x 2 ms = approximately 200 ms */
+        for (uint16_t i = 0; i < 100; i++)
+        {
+            HAL_GPIO_WritePin(
+                BUZZER_PORT, BUZZER_PIN, GPIO_PIN_SET
+            );
+            HAL_Delay(1);
+
+            HAL_GPIO_WritePin(
+                BUZZER_PORT, BUZZER_PIN, GPIO_PIN_RESET
+            );
+            HAL_Delay(1);
+        }
+    }
+    else
+    {
+        HAL_GPIO_WritePin(
+            BUZZER_PORT, BUZZER_PIN, GPIO_PIN_RESET
+        );
+    }
+}
+
+/* =========================================================
+   MAIN
+   ========================================================= */
+
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+
+    MX_GPIO_Init();
+    MX_I2C1_Init();
+    MX_ADC1_Init();
+
+    Buzzer_Tone(0);
+
+    OLED_Init();
+    OLED_Clear();
+
+    uint16_t adcValue;
+    uint32_t millivolts;
+    char line[22];
+
+    while (1)
+    {
+        adcValue = MQ2_ReadADC();
+
+        millivolts =
+            ((uint32_t)adcValue * 3300U) / 4095U;
+
+        OLED_Clear();
+
+        OLED_SetPosition(0, 0);
+        OLED_String("MQ2 GAS SENSOR");
+
+        OLED_SetPosition(2, 0);
+        snprintf(line, sizeof(line), "ADC:%4u", adcValue);
+        OLED_String(line);
+
+        OLED_SetPosition(4, 0);
+        snprintf(line, sizeof(line),
+                 "PA0:%lu.%02lu V",
+                 (unsigned long)(millivolts / 1000U),
+                 (unsigned long)((millivolts % 1000U) / 10U));
+        OLED_String(line);
+
+        OLED_SetPosition(6, 0);
+
+        if (adcValue >= MQ2_THRESHOLD)
+        {
+            OLED_String("GAS ALERT!");
+
+            /* Short tone each time this loop detects high gas */
+            Buzzer_Tone(1);
+        }
+        else
+        {
+            OLED_String("LEVEL: LOW");
+            Buzzer_Tone(0);
+        }
+
+        HAL_Delay(500);
+    }
+}
+
+/* =========================================================
+   CLOCK CONFIGURATION
+   HSI 16 MHz, PLL disabled
+   ========================================================= */
+
+void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef osc = {0};
+    RCC_ClkInitTypeDef clk = {0};
+
+    __HAL_RCC_PWR_CLK_ENABLE();
+
+    __HAL_PWR_VOLTAGESCALING_CONFIG(
+        PWR_REGULATOR_VOLTAGE_SCALE2
+    );
+
+    osc.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+    osc.HSIState = RCC_HSI_ON;
+    osc.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+    osc.PLL.PLLState = RCC_PLL_NONE;
+
+    if (HAL_RCC_OscConfig(&osc) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    clk.ClockType = RCC_CLOCKTYPE_HCLK |
+                    RCC_CLOCKTYPE_SYSCLK |
+                    RCC_CLOCKTYPE_PCLK1 |
+                    RCC_CLOCKTYPE_PCLK2;
+
+    clk.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+    clk.AHBCLKDivider = RCC_SYSCLK_DIV1;
+    clk.APB1CLKDivider = RCC_HCLK_DIV1;
+    clk.APB2CLKDivider = RCC_HCLK_DIV1;
+
+    if (HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_0) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+/* =========================================================
+   GPIO CONFIGURATION
+   PA0     : MQ-2 analog input
+   PB6/PB7 : I2C1 OLED
+   PB9     : Buzzer signal
+   ========================================================= */
+
+static void MX_GPIO_Init(void)
+{
+    GPIO_InitTypeDef gpio = {0};
+
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    /* Start buzzer signal LOW */
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_RESET);
+
+    /* PA0: MQ-2 analog input */
+    gpio.Pin = GPIO_PIN_0;
+    gpio.Mode = GPIO_MODE_ANALOG;
+    gpio.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOA, &gpio);
+
+    /* PB6/PB7: I2C1 for OLED */
+    gpio.Pin = GPIO_PIN_6 | GPIO_PIN_7;
+    gpio.Mode = GPIO_MODE_AF_OD;
+    gpio.Pull = GPIO_PULLUP;
+    gpio.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    gpio.Alternate = GPIO_AF4_I2C1;
+    HAL_GPIO_Init(GPIOB, &gpio);
+
+    /* PB9: buzzer signal output */
+    gpio.Pin = GPIO_PIN_9;
+    gpio.Mode = GPIO_MODE_OUTPUT_PP;
+    gpio.Pull = GPIO_NOPULL;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOB, &gpio);
+}
+
+/* =========================================================
+   I2C1 CONFIGURATION
+   ========================================================= */
+
+static void MX_I2C1_Init(void)
+{
+    __HAL_RCC_I2C1_CLK_ENABLE();
+
+    hi2c1.Instance = I2C1;
+    hi2c1.Init.ClockSpeed = 100000;
+    hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+    hi2c1.Init.OwnAddress1 = 0;
+    hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+    hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+    hi2c1.Init.OwnAddress2 = 0;
+    hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+    hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+
+    if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+/* =========================================================
+   ADC1 CONFIGURATION
+   PA0 = ADC1_IN0
+   ========================================================= */
+
+static void MX_ADC1_Init(void)
+{
+    __HAL_RCC_ADC1_CLK_ENABLE();
+
+    hadc1.Instance = ADC1;
+    hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+    hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+    hadc1.Init.ScanConvMode = DISABLE;
+    hadc1.Init.ContinuousConvMode = DISABLE;
+    hadc1.Init.DiscontinuousConvMode = DISABLE;
+    hadc1.Init.ExternalTrigConvEdge =
+        ADC_EXTERNALTRIGCONVEDGE_NONE;
+    hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+    hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+    hadc1.Init.NbrOfConversion = 1;
+    hadc1.Init.DMAContinuousRequests = DISABLE;
+    hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+
+    if (HAL_ADC_Init(&hadc1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    ADC_ChannelConfTypeDef config = {0};
+
+    config.Channel = ADC_CHANNEL_0;
+    config.Rank = 1;
+    config.SamplingTime = ADC_SAMPLETIME_144CYCLES;
+
+    if (HAL_ADC_ConfigChannel(&hadc1, &config) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+/* =========================================================
+   ERROR HANDLER
+   ========================================================= */
+
+void Error_Handler(void)
+{
+    __disable_irq();
+
+    while (1)
+    {
+    }
+}

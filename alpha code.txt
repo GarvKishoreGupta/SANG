@@ -1,0 +1,1015 @@
+/* Integrated STM32F411CEU6 Smart Home Automation System
+ * Built from the five user-provided working modules.
+ * OLED: password keypad is the main screen; top line shows T/H/Smoke.
+ * Door servo PA8/TIM1_CH1; garage RFID servo PA9/TIM1_CH2.
+ * MQ-2 PA0/ADC1_IN0; buzzer PB9; DHT22 PB14; fan PB4/TIM3_CH1.
+ * LDR D0 PB15; PIR PA1; LED PB8. OLED I2C1 PB6/PB7.
+ * RC522 SPI1: PA4 CS, PA5 SCK, PA6 MISO, PA7 MOSI, PB10 RST.
+ */
+#include "main.h"
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+#define OLED_ADDR (0x3C << 1)
+#define BUZZER_PORT GPIOB
+#define BUZZER_PIN GPIO_PIN_9
+#define PASSWORD "1234"
+#define MAX_PASSWORD_LENGTH 8
+#define SERVO_LOCKED_PULSE 1000U
+#define SERVO_UNLOCKED_PULSE 2000U
+#define GARAGE_SERVO_OPEN 2000U
+#define GARAGE_SERVO_CLOSE 1000U
+#define GARAGE_OPEN_TIME 10000U
+#define MQ2_THRESHOLD 300U /* Experimental ADC threshold; calibrate for your sensor */
+#define DHT22_PORT GPIOB
+#define DHT22_PIN GPIO_PIN_14
+#define FAN_PORT GPIOB
+#define FAN_PIN GPIO_PIN_4
+#define FAN_OFF 0U
+#define FAN_LOW 350U
+#define FAN_MEDIUM 650U
+#define FAN_HIGH 1000U
+#define TEMP_LIMIT 250U
+#define HUM_LIMIT 800U
+#define RFID_CS_PORT GPIOA
+#define RFID_CS_PIN GPIO_PIN_4
+#define RFID_RST_PORT GPIOB
+#define RFID_RST_PIN GPIO_PIN_10
+#define RFID_KEY_UID_0 0x14
+#define RFID_KEY_UID_1 0x81
+#define RFID_KEY_UID_2 0xBA
+#define RFID_KEY_UID_3 0xA3
+#define RFID_CARD_UID_0 0x33
+#define RFID_CARD_UID_1 0xFD
+#define RFID_CARD_UID_2 0xFD
+#define RFID_CARD_UID_3 0x31
+
+I2C_HandleTypeDef hi2c1;
+SPI_HandleTypeDef hspi1;
+ADC_HandleTypeDef hadc1;
+TIM_HandleTypeDef htim1;
+TIM_HandleTypeDef htim3;
+/* Required because the CubeMX-generated stm32f4xx_it.c references huart2.
+   UART2 is not initialized/used by this integrated build yet. */
+UART_HandleTypeDef huart2;
+
+void SystemClock_Config(void);
+void Error_Handler(void);
+static void MX_GPIO_Init(void);
+static void MX_I2C1_Init(void);
+static void MX_SPI1_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_TIM1_Init(void);
+static void MX_TIM3_Init(void);
+static void OLED_Command(uint8_t cmd);
+static void OLED_Data(uint8_t data);
+static void OLED_Init(void);
+static void OLED_SetPosition(uint8_t page, uint8_t col);
+static void OLED_Clear(void);
+static void OLED_Char(char c);
+static void Keypad_Init(void);
+static char Keypad_GetKey(void);
+static void Servo_SetPosition(uint16_t pulse);
+static void DHT22_Init(void);
+static void DHT22_DelayUs(uint32_t us);
+static void DHT22_SetInput(void);
+static void DHT22_SetOutput(void);
+static uint8_t DHT22_WaitLevel(GPIO_PinState level, uint32_t timeout_us);
+static uint8_t DHT22_ReadByte(uint8_t *value);
+static uint8_t DHT22_Read(int16_t *temperature, uint16_t *humidity);
+static uint16_t MQ2_ReadADC(void);
+static void Buzzer_Tone(uint8_t enable);
+static void Fan_SetSpeed(uint16_t duty);
+void RFID_Init(void);
+uint8_t RFID_ReadUID(uint8_t *uid);
+uint8_t RFID_ReadRegister(uint8_t reg);
+void RFID_WriteRegister(uint8_t reg, uint8_t value);
+void GarageServo_Set(uint16_t pulse);
+static void OLED_WriteAt(uint8_t page, uint8_t col, const char *str);
+static void UpdateSensorCorner(int16_t temperature, uint16_t humidity, uint8_t dhtOK, uint16_t smoke);
+static void UpdatePasswordArea(const char *maskedPassword, const char *message);
+
+/* Keypad mapping from the working 4x3 keypad module. */
+static GPIO_TypeDef *rowPort[4] = {GPIOB, GPIOB, GPIOB, GPIOB};
+static const uint16_t rowPin[4] = {
+    GPIO_PIN_0, GPIO_PIN_1, GPIO_PIN_2, GPIO_PIN_3
+};
+static GPIO_TypeDef *colPort[3] = {GPIOA, GPIOB, GPIOB};
+static const uint16_t colPin[3] = {
+    GPIO_PIN_15, GPIO_PIN_12, GPIO_PIN_13
+};
+static const char keyMap[4][3] = {
+    {'1', '2', '3'},
+    {'4', '5', '6'},
+    {'7', '8', '9'},
+    {'*', '0', '#'}
+};
+
+#define REG_COMMAND        0x01
+#define REG_COM_IRQ        0x04
+#define REG_ERROR          0x06
+#define REG_FIFO_DATA      0x09
+#define REG_FIFO_LEVEL     0x0A
+#define REG_BIT_FRAMING    0x0D
+#define REG_TX_CONTROL     0x14
+#define REG_TX_ASK         0x15
+#define REG_MODE            0x11
+#define REG_T_MODE          0x2A
+#define REG_T_PRESCALER     0x2B
+#define REG_T_RELOAD_H      0x2C
+#define REG_T_RELOAD_L      0x2D
+#define REG_VERSION         0x37
+
+#define CMD_IDLE            0x00
+#define CMD_TRANSCEIVE      0x0C
+#define CMD_SOFT_RESET      0x0F
+
+#define PICC_REQA           0x26
+#define PICC_ANTICOLL       0x93
+
+static const uint8_t font5x7[][5] = {
+    {0,0,0,0,0},
+    {0,0,0x5F,0,0},
+    {0,0x07,0,0x07,0},
+    {0x14,0x7F,0x14,0x7F,0x14},
+    {0x24,0x2A,0x7F,0x2A,0x12},
+    {0x23,0x13,0x08,0x64,0x62},
+    {0x36,0x49,0x55,0x22,0x50},
+    {0,0x05,0x03,0,0},
+    {0,0x1C,0x22,0x41,0},
+    {0,0x41,0x22,0x1C,0},
+    {0x14,0x08,0x3E,0x08,0x14},
+    {0x08,0x08,0x3E,0x08,0x08},
+    {0,0x50,0x30,0,0},
+    {0x08,0x08,0x08,0x08,0x08},
+    {0,0x60,0x60,0,0},
+    {0x20,0x10,0x08,0x04,0x02},
+    {0x3E,0x51,0x49,0x45,0x3E},
+    {0,0x42,0x7F,0x40,0},
+    {0x42,0x61,0x51,0x49,0x46},
+    {0x21,0x41,0x45,0x4B,0x31},
+    {0x18,0x14,0x12,0x7F,0x10},
+    {0x27,0x45,0x45,0x45,0x39},
+    {0x3C,0x4A,0x49,0x49,0x30},
+    {0x01,0x71,0x09,0x05,0x03},
+    {0x36,0x49,0x49,0x49,0x36},
+    {0x06,0x49,0x49,0x29,0x1E},
+    {0,0x36,0x36,0,0},
+    {0,0x56,0x36,0,0},
+    {0x08,0x14,0x22,0x41,0},
+    {0x14,0x14,0x14,0x14,0x14},
+    {0,0x41,0x22,0x14,0x08},
+    {0x02,0x01,0x51,0x09,0x06},
+    {0x32,0x49,0x79,0x41,0x3E},
+    {0x7E,0x11,0x11,0x11,0x7E},
+    {0x7F,0x49,0x49,0x49,0x36},
+    {0x3E,0x41,0x41,0x41,0x22},
+    {0x7F,0x41,0x41,0x22,0x1C},
+    {0x7F,0x49,0x49,0x49,0x41},
+    {0x7F,0x09,0x09,0x09,0x01},
+    {0x3E,0x41,0x49,0x49,0x7A},
+    {0x7F,0x08,0x08,0x08,0x7F},
+    {0,0x41,0x7F,0x41,0},
+    {0x20,0x40,0x41,0x3F,0x01},
+    {0x7F,0x08,0x14,0x22,0x41},
+    {0x7F,0x40,0x40,0x40,0x40},
+    {0x7F,0x02,0x0C,0x02,0x7F},
+    {0x7F,0x04,0x08,0x10,0x7F},
+    {0x3E,0x41,0x41,0x41,0x3E},
+    {0x7F,0x09,0x09,0x09,0x06},
+    {0x3E,0x41,0x51,0x21,0x5E},
+    {0x7F,0x09,0x19,0x29,0x46},
+    {0x46,0x49,0x49,0x49,0x31},
+    {0x01,0x01,0x7F,0x01,0x01},
+    {0x3F,0x40,0x40,0x40,0x3F},
+    {0x1F,0x20,0x40,0x20,0x1F},
+    {0x3F,0x40,0x38,0x40,0x3F},
+    {0x63,0x14,0x08,0x14,0x63},
+    {0x07,0x08,0x70,0x08,0x07},
+    {0x61,0x51,0x49,0x45,0x43}
+};
+
+static void OLED_Command(uint8_t cmd)
+{
+    uint8_t buf[2] = {0x00, cmd};
+
+    HAL_I2C_Master_Transmit(
+        &hi2c1, OLED_ADDR, buf, 2, 100
+    );
+}
+
+static void OLED_Data(uint8_t data)
+{
+    uint8_t buf[2] = {0x40, data};
+
+    HAL_I2C_Master_Transmit(
+        &hi2c1, OLED_ADDR, buf, 2, 100
+    );
+}
+
+static void OLED_Init(void)
+{
+    HAL_Delay(100);
+
+    OLED_Command(0xAE);
+    OLED_Command(0xD5); OLED_Command(0x80);
+    OLED_Command(0xA8); OLED_Command(0x3F);
+    OLED_Command(0xD3); OLED_Command(0x00);
+    OLED_Command(0x40);
+    OLED_Command(0xAD); OLED_Command(0x8B);
+    OLED_Command(0xA1);
+    OLED_Command(0xC8);
+    OLED_Command(0xDA); OLED_Command(0x12);
+    OLED_Command(0x81); OLED_Command(0x7F);
+    OLED_Command(0xD9); OLED_Command(0x22);
+    OLED_Command(0xDB); OLED_Command(0x35);
+    OLED_Command(0xA4);
+    OLED_Command(0xA6);
+    OLED_Command(0xAF);
+}
+
+static void OLED_SetPosition(uint8_t page, uint8_t col)
+{
+    col += 2;
+
+    OLED_Command(0xB0 | page);
+    OLED_Command(0x10 | (col >> 4));
+    OLED_Command(0x00 | (col & 0x0F));
+}
+
+static void OLED_Clear(void)
+{
+    for (uint8_t page = 0; page < 8; page++)
+    {
+        OLED_SetPosition(page, 0);
+
+        for (uint8_t col = 0; col < 128; col++)
+            OLED_Data(0x00);
+    }
+}
+
+static void OLED_Char(char c)
+{
+    if (c >= 'a' && c <= 'z')
+        c -= ('a' - 'A');
+
+    if (c < 32 || c > 90)
+        c = ' ';
+
+    uint8_t index = (uint8_t)c - 32;
+
+    for (uint8_t i = 0; i < 5; i++)
+        OLED_Data(font5x7[index][i]);
+
+    OLED_Data(0x00);
+}
+
+static void OLED_WriteAt(uint8_t page, uint8_t col, const char *str)
+{
+    OLED_SetPosition(page, col);
+    while (*str && col < 122) { OLED_Char(*str++); col = (uint8_t)(col + 6); }
+}
+
+static void UpdateSensorCorner(int16_t temperature, uint16_t humidity, uint8_t dhtOK, uint16_t smoke)
+{
+    char line[24];
+    /* Compact top-line values fit the 128-pixel OLED (about 21 characters). */
+    if (dhtOK)
+        snprintf(line, sizeof(line), "T%d.%d H%u.%u S%u",
+                 temperature / 10,
+                 (temperature < 0 ? -temperature : temperature) % 10,
+                 humidity / 10U, humidity % 10U, smoke);
+    else
+        snprintf(line, sizeof(line), "T--.- H--.- S%u", smoke);
+    OLED_WriteAt(0, 0, line);
+}
+
+static void Keypad_Init(void)
+{
+    GPIO_InitTypeDef gpio = {0};
+
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    /* Rows PB0-PB3: output push-pull */
+    gpio.Pin = GPIO_PIN_0 | GPIO_PIN_1 |
+               GPIO_PIN_2 | GPIO_PIN_3;
+    gpio.Mode = GPIO_MODE_OUTPUT_PP;
+    gpio.Pull = GPIO_NOPULL;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+
+    HAL_GPIO_Init(GPIOB, &gpio);
+
+    HAL_GPIO_WritePin(
+        GPIOB,
+        GPIO_PIN_0 | GPIO_PIN_1 |
+        GPIO_PIN_2 | GPIO_PIN_3,
+        GPIO_PIN_SET
+    );
+
+    /* Column C1: PA15 */
+    gpio.Pin = GPIO_PIN_15;
+    gpio.Mode = GPIO_MODE_INPUT;
+    gpio.Pull = GPIO_PULLUP;
+    HAL_GPIO_Init(GPIOA, &gpio);
+
+    /* Columns C2 and C3: PB12 and PB13 */
+    gpio.Pin = GPIO_PIN_12 | GPIO_PIN_13;
+    gpio.Mode = GPIO_MODE_INPUT;
+    gpio.Pull = GPIO_PULLUP;
+    HAL_GPIO_Init(GPIOB, &gpio);
+}
+
+static char Keypad_GetKey(void)
+{
+    for (int row = 0; row < 4; row++)
+    {
+        /* All rows HIGH */
+        for (int r = 0; r < 4; r++)
+        {
+            HAL_GPIO_WritePin(
+                rowPort[r], rowPin[r], GPIO_PIN_SET
+            );
+        }
+
+        /* Current row LOW */
+        HAL_GPIO_WritePin(
+            rowPort[row], rowPin[row], GPIO_PIN_RESET
+        );
+
+        HAL_Delay(2);
+
+        for (int col = 0; col < 3; col++)
+        {
+            if (HAL_GPIO_ReadPin(
+                    colPort[col], colPin[col]
+                ) == GPIO_PIN_RESET)
+            {
+                HAL_Delay(20);
+
+                if (HAL_GPIO_ReadPin(
+                        colPort[col], colPin[col]
+                    ) == GPIO_PIN_RESET)
+                {
+                    char key = keyMap[row][col];
+
+                    /* Wait until key is released */
+                    while (HAL_GPIO_ReadPin(
+                               colPort[col], colPin[col]
+                           ) == GPIO_PIN_RESET)
+                    {
+                        HAL_Delay(5);
+                    }
+
+                    HAL_Delay(30);
+                    return key;
+                }
+            }
+        }
+    }
+
+    return '\0';
+}
+
+static void Servo_SetPosition(uint16_t pulse)
+{
+    __HAL_TIM_SET_COMPARE(
+        &htim1, TIM_CHANNEL_1, pulse
+    );
+}
+
+static void UpdatePasswordArea(const char *maskedPassword, const char *message)
+{
+    char line[22];
+    OLED_WriteAt(2, 0, "ENTER PASSWORD:       ");
+    snprintf(line, sizeof(line), "%-20.20s", maskedPassword[0] ? maskedPassword : "_");
+    OLED_WriteAt(4, 0, line);
+    snprintf(line, sizeof(line), "%-20.20s", message);
+    OLED_WriteAt(6, 0, line);
+}
+
+
+/* DHT22 microsecond driver copied from the supplied working module. */
+static void DHT22_DelayUs(uint32_t us)
+{
+    uint32_t start = DWT->CYCCNT;
+    uint32_t cycles = (SystemCoreClock / 1000000U) * us;
+
+    while ((uint32_t)(DWT->CYCCNT - start) < cycles)
+    {
+    }
+}
+
+static void DHT22_SetInput(void)
+{
+    GPIO_InitTypeDef gpio = {0};
+    gpio.Pin = DHT22_PIN;
+    gpio.Mode = GPIO_MODE_INPUT;
+    gpio.Pull = GPIO_PULLUP;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(DHT22_PORT, &gpio);
+}
+
+static void DHT22_SetOutput(void)
+{
+    GPIO_InitTypeDef gpio = {0};
+    gpio.Pin = DHT22_PIN;
+    gpio.Mode = GPIO_MODE_OUTPUT_OD;
+    gpio.Pull = GPIO_PULLUP;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(DHT22_PORT, &gpio);
+}
+
+static void DHT22_Init(void)
+{
+    GPIO_InitTypeDef gpio = {0};
+
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
+    gpio.Pin = DHT22_PIN;
+    gpio.Mode = GPIO_MODE_OUTPUT_OD;
+    gpio.Pull = GPIO_PULLUP;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(DHT22_PORT, &gpio);
+
+    HAL_GPIO_WritePin(DHT22_PORT, DHT22_PIN, GPIO_PIN_SET);
+}
+
+static uint8_t DHT22_WaitLevel(GPIO_PinState level,
+                               uint32_t timeout_us)
+{
+    uint32_t start = DWT->CYCCNT;
+    uint32_t timeout_cycles =
+        (SystemCoreClock / 1000000U) * timeout_us;
+
+    while (HAL_GPIO_ReadPin(DHT22_PORT, DHT22_PIN) != level)
+    {
+        if ((uint32_t)(DWT->CYCCNT - start) >= timeout_cycles)
+            return 0;
+    }
+
+    return 1;
+}
+
+static uint8_t DHT22_ReadByte(uint8_t *value)
+{
+    uint8_t result = 0;
+
+    for (uint8_t i = 0; i < 8; i++)
+    {
+        if (!DHT22_WaitLevel(GPIO_PIN_RESET, 100))
+            return 0;
+
+        if (!DHT22_WaitLevel(GPIO_PIN_SET, 100))
+            return 0;
+
+        DHT22_DelayUs(40);
+        result <<= 1;
+
+        if (HAL_GPIO_ReadPin(DHT22_PORT, DHT22_PIN)
+            == GPIO_PIN_SET)
+        {
+            result |= 1;
+        }
+    }
+
+    *value = result;
+    return 1;
+}
+
+static uint8_t DHT22_Read(int16_t *temperature,
+                          uint16_t *humidity)
+{
+    uint8_t data[5] = {0};
+
+    DHT22_SetOutput();
+    HAL_GPIO_WritePin(DHT22_PORT, DHT22_PIN, GPIO_PIN_RESET);
+    HAL_Delay(2);
+
+    HAL_GPIO_WritePin(DHT22_PORT, DHT22_PIN, GPIO_PIN_SET);
+    DHT22_DelayUs(30);
+    DHT22_SetInput();
+
+    if (!DHT22_WaitLevel(GPIO_PIN_RESET, 100))
+        return 0;
+
+    if (!DHT22_WaitLevel(GPIO_PIN_SET, 100))
+        return 0;
+
+    if (!DHT22_WaitLevel(GPIO_PIN_RESET, 100))
+        return 0;
+
+    for (uint8_t i = 0; i < 5; i++)
+    {
+        if (!DHT22_ReadByte(&data[i]))
+            return 0;
+    }
+
+    if ((uint8_t)(data[0] + data[1] + data[2] + data[3])
+        != data[4])
+    {
+        return 0;
+    }
+
+    *humidity = ((uint16_t)data[0] << 8) | data[1];
+
+    uint16_t rawTemperature =
+        ((uint16_t)(data[2] & 0x7F) << 8) | data[3];
+
+    if (data[2] & 0x80)
+        *temperature = -(int16_t)rawTemperature;
+    else
+        *temperature = (int16_t)rawTemperature;
+
+    return 1;
+}
+
+
+static uint16_t MQ2_ReadADC(void)
+{
+    uint16_t value = 0;
+    if (HAL_ADC_Start(&hadc1) != HAL_OK) return 0;
+    if (HAL_ADC_PollForConversion(&hadc1, 20) == HAL_OK) value = (uint16_t)HAL_ADC_GetValue(&hadc1);
+    HAL_ADC_Stop(&hadc1);
+    return value;
+}
+
+static void Buzzer_Tone(uint8_t enable)
+{
+    if (!enable) { HAL_GPIO_WritePin(BUZZER_PORT, BUZZER_PIN, GPIO_PIN_RESET); return; }
+    for (uint16_t i = 0; i < 100; i++) {
+        HAL_GPIO_WritePin(BUZZER_PORT, BUZZER_PIN, GPIO_PIN_SET); HAL_Delay(1);
+        HAL_GPIO_WritePin(BUZZER_PORT, BUZZER_PIN, GPIO_PIN_RESET); HAL_Delay(1);
+    }
+}
+
+static void Fan_SetSpeed(uint16_t duty)
+{
+    if (duty > 1000U)
+        duty = 1000U;
+
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, duty);
+}
+
+
+/* RC522 SPI driver copied from the supplied RFID module. */
+static void RFID_Select(void)
+{
+    HAL_GPIO_WritePin(RFID_CS_PORT, RFID_CS_PIN, GPIO_PIN_RESET);
+}
+
+static void RFID_Deselect(void)
+{
+    HAL_GPIO_WritePin(RFID_CS_PORT, RFID_CS_PIN, GPIO_PIN_SET);
+}
+
+void RFID_WriteRegister(uint8_t reg, uint8_t value)
+{
+    uint8_t tx[2];
+
+    tx[0] = (uint8_t)((reg << 1) & 0x7E);
+    tx[1] = value;
+
+    RFID_Select();
+    HAL_SPI_Transmit(&hspi1, tx, 2, HAL_MAX_DELAY);
+    RFID_Deselect();
+}
+
+uint8_t RFID_ReadRegister(uint8_t reg)
+{
+    uint8_t tx[2] = {
+        (uint8_t)(((reg << 1) & 0x7E) | 0x80), 0
+    };
+    uint8_t rx[2] = {0, 0};
+
+    RFID_Select();
+    HAL_SPI_TransmitReceive(&hspi1, tx, rx, 2, HAL_MAX_DELAY);
+    RFID_Deselect();
+
+    return rx[1];
+}
+
+static void RFID_SetBits(uint8_t reg, uint8_t mask)
+{
+    RFID_WriteRegister(reg, RFID_ReadRegister(reg) | mask);
+}
+
+static void RFID_ClearBits(uint8_t reg, uint8_t mask)
+{
+    RFID_WriteRegister(reg,
+                       RFID_ReadRegister(reg) & (uint8_t)(~mask));
+}
+
+static void RFID_AntennaOn(void)
+{
+    if ((RFID_ReadRegister(REG_TX_CONTROL) & 0x03) != 0x03)
+        RFID_SetBits(REG_TX_CONTROL, 0x03);
+}
+
+void RFID_Init(void)
+{
+    HAL_GPIO_WritePin(RFID_RST_PORT, RFID_RST_PIN, GPIO_PIN_SET);
+    HAL_Delay(50);
+
+    RFID_WriteRegister(REG_COMMAND, CMD_SOFT_RESET);
+    HAL_Delay(50);
+
+    RFID_WriteRegister(REG_T_MODE, 0x8D);
+    RFID_WriteRegister(REG_T_PRESCALER, 0x3E);
+    RFID_WriteRegister(REG_T_RELOAD_H, 0x00);
+    RFID_WriteRegister(REG_T_RELOAD_L, 30);
+    RFID_WriteRegister(REG_TX_ASK, 0x40);
+    RFID_WriteRegister(REG_MODE, 0x3D);
+
+    RFID_AntennaOn();
+}
+
+static uint8_t RFID_Transceive(uint8_t *sendData,
+                              uint8_t sendLen,
+                              uint8_t *backData,
+                              uint8_t *backLen,
+                              uint8_t validBits)
+{
+    uint8_t irq;
+    uint8_t error;
+    uint32_t timeout = 20000;
+
+    RFID_WriteRegister(REG_COMMAND, CMD_IDLE);
+    RFID_WriteRegister(REG_COM_IRQ, 0x7F);
+    RFID_WriteRegister(REG_FIFO_LEVEL, 0x80);
+
+    for (uint8_t i = 0; i < sendLen; i++)
+        RFID_WriteRegister(REG_FIFO_DATA, sendData[i]);
+
+    RFID_WriteRegister(REG_BIT_FRAMING, validBits);
+    RFID_WriteRegister(REG_COMMAND, CMD_TRANSCEIVE);
+    RFID_SetBits(REG_BIT_FRAMING, 0x80);
+
+    do
+    {
+        irq = RFID_ReadRegister(REG_COM_IRQ);
+        timeout--;
+    }
+    while (timeout && !(irq & 0x30) && !(irq & 0x01));
+
+    RFID_ClearBits(REG_BIT_FRAMING, 0x80);
+
+    if (timeout == 0 || (irq & 0x01))
+        return 0;
+
+    error = RFID_ReadRegister(REG_ERROR);
+
+    if (error & 0x1B)
+        return 0;
+
+    if (backData && backLen)
+    {
+        uint8_t fifoCount = RFID_ReadRegister(REG_FIFO_LEVEL);
+
+        if (fifoCount > *backLen)
+            return 0;
+
+        *backLen = fifoCount;
+
+        for (uint8_t i = 0; i < fifoCount; i++)
+            backData[i] = RFID_ReadRegister(REG_FIFO_DATA);
+    }
+
+    return 1;
+}
+
+uint8_t RFID_ReadUID(uint8_t *uid)
+{
+    uint8_t request = PICC_REQA;
+    uint8_t atqa[2];
+    uint8_t atqaLen = sizeof(atqa);
+
+    if (!RFID_Transceive(&request, 1, atqa, &atqaLen, 0x07))
+        return 0;
+
+    uint8_t anticoll[2] = {PICC_ANTICOLL, 0x20};
+    uint8_t response[5];
+    uint8_t responseLen = sizeof(response);
+
+    if (!RFID_Transceive(anticoll, 2, response,
+                         &responseLen, 0x00))
+        return 0;
+
+    if (responseLen != 5)
+        return 0;
+
+    if ((uint8_t)(response[0] ^ response[1] ^
+                  response[2] ^ response[3]) != response[4])
+        return 0;
+
+    for (uint8_t i = 0; i < 4; i++)
+        uid[i] = response[i];
+
+    return 1;
+}
+
+
+void GarageServo_Set(uint16_t pulse)
+{
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, pulse);
+}
+
+/* Combined GPIO initialization. Avoid initializing pins owned by alternate functions here. */
+static void MX_GPIO_Init(void)
+{
+    GPIO_InitTypeDef g = {0};
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    /* Initial output levels */
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET); /* RC522 CS idle */
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET); /* RC522 reset */
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8 | GPIO_PIN_9, GPIO_PIN_RESET); /* LED/buzzer */
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3, GPIO_PIN_SET);
+
+    /* RC522 chip select and reset */
+    g.Pin = GPIO_PIN_4; g.Mode = GPIO_MODE_OUTPUT_PP; g.Pull = GPIO_NOPULL; g.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    HAL_GPIO_Init(GPIOA, &g);
+    g.Pin = GPIO_PIN_10; g.Speed = GPIO_SPEED_FREQ_LOW; HAL_GPIO_Init(GPIOB, &g);
+
+    /* OLED I2C1 PB6/PB7 */
+    g.Pin = GPIO_PIN_6 | GPIO_PIN_7; g.Mode = GPIO_MODE_AF_OD; g.Pull = GPIO_PULLUP;
+    g.Speed = GPIO_SPEED_FREQ_VERY_HIGH; g.Alternate = GPIO_AF4_I2C1; HAL_GPIO_Init(GPIOB, &g);
+    /* RC522 SPI1 PA5/PA6/PA7 */
+    g.Pin = GPIO_PIN_5 | GPIO_PIN_6 | GPIO_PIN_7; g.Mode = GPIO_MODE_AF_PP; g.Pull = GPIO_NOPULL;
+    g.Speed = GPIO_SPEED_FREQ_VERY_HIGH; g.Alternate = GPIO_AF5_SPI1; HAL_GPIO_Init(GPIOA, &g);
+
+    /* MQ-2 analog PA0 */
+    g.Pin = GPIO_PIN_0; g.Mode = GPIO_MODE_ANALOG; g.Pull = GPIO_NOPULL; HAL_GPIO_Init(GPIOA, &g);
+    /* PIR PA1 */
+    g.Pin = GPIO_PIN_1; g.Mode = GPIO_MODE_INPUT; g.Pull = GPIO_NOPULL; HAL_GPIO_Init(GPIOA, &g);
+    /* Main door servo PA8 / TIM1_CH1, garage servo PA9 / TIM1_CH2 */
+    g.Pin = GPIO_PIN_8 | GPIO_PIN_9; g.Mode = GPIO_MODE_AF_PP; g.Pull = GPIO_NOPULL;
+    g.Speed = GPIO_SPEED_FREQ_LOW; g.Alternate = GPIO_AF1_TIM1; HAL_GPIO_Init(GPIOA, &g);
+    /* Keypad C1 PA15 */
+    g.Pin = GPIO_PIN_15; g.Mode = GPIO_MODE_INPUT; g.Pull = GPIO_PULLUP; HAL_GPIO_Init(GPIOA, &g);
+
+    /* Keypad rows PB0-PB3 */
+    g.Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3;
+    g.Mode = GPIO_MODE_OUTPUT_PP; g.Pull = GPIO_NOPULL; g.Speed = GPIO_SPEED_FREQ_LOW; HAL_GPIO_Init(GPIOB, &g);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3, GPIO_PIN_SET);
+    /* Keypad columns PB12/PB13 */
+    g.Pin = GPIO_PIN_12 | GPIO_PIN_13; g.Mode = GPIO_MODE_INPUT; g.Pull = GPIO_PULLUP; HAL_GPIO_Init(GPIOB, &g);
+    /* DHT22 PB14 is configured dynamically by its driver */
+    /* LDR PB15 */
+    g.Pin = GPIO_PIN_15; g.Mode = GPIO_MODE_INPUT; g.Pull = GPIO_PULLDOWN; HAL_GPIO_Init(GPIOB, &g);
+    /* LED PB8, buzzer PB9 */
+    g.Pin = GPIO_PIN_8 | GPIO_PIN_9; g.Mode = GPIO_MODE_OUTPUT_PP; g.Pull = GPIO_NOPULL; g.Speed = GPIO_SPEED_FREQ_LOW; HAL_GPIO_Init(GPIOB, &g);
+}
+
+static void MX_I2C1_Init(void)
+{
+    __HAL_RCC_I2C1_CLK_ENABLE();
+    hi2c1.Instance = I2C1; hi2c1.Init.ClockSpeed = 100000; hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+    hi2c1.Init.OwnAddress1 = 0; hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+    hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE; hi2c1.Init.OwnAddress2 = 0;
+    hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE; hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+    if (HAL_I2C_Init(&hi2c1) != HAL_OK) Error_Handler();
+}
+
+static void MX_SPI1_Init(void)
+{
+    __HAL_RCC_SPI1_CLK_ENABLE();
+    hspi1.Instance = SPI1; hspi1.Init.Mode = SPI_MODE_MASTER; hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+    hspi1.Init.DataSize = SPI_DATASIZE_8BIT; hspi1.Init.CLKPolarity = SPI_POLARITY_LOW; hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+    hspi1.Init.NSS = SPI_NSS_SOFT; hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
+    hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB; hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+    hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE; hspi1.Init.CRCPolynomial = 10;
+    if (HAL_SPI_Init(&hspi1) != HAL_OK) Error_Handler();
+}
+
+static void MX_ADC1_Init(void)
+{
+    __HAL_RCC_ADC1_CLK_ENABLE();
+    hadc1.Instance = ADC1; hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4; hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+    hadc1.Init.ScanConvMode = DISABLE; hadc1.Init.ContinuousConvMode = DISABLE; hadc1.Init.DiscontinuousConvMode = DISABLE;
+    hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE; hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+    hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT; hadc1.Init.NbrOfConversion = 1; hadc1.Init.DMAContinuousRequests = DISABLE;
+    hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+    if (HAL_ADC_Init(&hadc1) != HAL_OK) Error_Handler();
+    ADC_ChannelConfTypeDef c = {0}; c.Channel = ADC_CHANNEL_0; c.Rank = 1; c.SamplingTime = ADC_SAMPLETIME_144CYCLES;
+    if (HAL_ADC_ConfigChannel(&hadc1, &c) != HAL_OK) Error_Handler();
+}
+
+static void MX_TIM1_Init(void)
+{
+    TIM_OC_InitTypeDef oc = {0};
+    __HAL_RCC_TIM1_CLK_ENABLE();
+    htim1.Instance = TIM1; htim1.Init.Prescaler = 15; htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+    htim1.Init.Period = 19999; htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1; htim1.Init.RepetitionCounter = 0;
+    htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+    if (HAL_TIM_PWM_Init(&htim1) != HAL_OK) Error_Handler();
+    oc.OCMode = TIM_OCMODE_PWM1; oc.Pulse = SERVO_LOCKED_PULSE; oc.OCPolarity = TIM_OCPOLARITY_HIGH; oc.OCFastMode = TIM_OCFAST_DISABLE;
+    if (HAL_TIM_PWM_ConfigChannel(&htim1, &oc, TIM_CHANNEL_1) != HAL_OK) Error_Handler();
+    oc.Pulse = GARAGE_SERVO_CLOSE;
+    if (HAL_TIM_PWM_ConfigChannel(&htim1, &oc, TIM_CHANNEL_2) != HAL_OK) Error_Handler();
+}
+
+static void MX_TIM3_Init(void)
+{
+    TIM_OC_InitTypeDef oc = {0}; GPIO_InitTypeDef g = {0};
+    __HAL_RCC_TIM3_CLK_ENABLE();
+    g.Pin = FAN_PIN; g.Mode = GPIO_MODE_AF_PP; g.Pull = GPIO_NOPULL; g.Speed = GPIO_SPEED_FREQ_LOW; g.Alternate = GPIO_AF2_TIM3;
+    HAL_GPIO_Init(FAN_PORT, &g);
+    htim3.Instance = TIM3; htim3.Init.Prescaler = 15; htim3.Init.CounterMode = TIM_COUNTERMODE_UP; htim3.Init.Period = 999;
+    htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1; htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+    if (HAL_TIM_PWM_Init(&htim3) != HAL_OK) Error_Handler();
+    oc.OCMode = TIM_OCMODE_PWM1; oc.Pulse = FAN_OFF; oc.OCPolarity = TIM_OCPOLARITY_HIGH; oc.OCFastMode = TIM_OCFAST_DISABLE;
+    if (HAL_TIM_PWM_ConfigChannel(&htim3, &oc, TIM_CHANNEL_1) != HAL_OK) Error_Handler();
+}
+
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_I2C1_Init();
+    MX_SPI1_Init();
+    MX_ADC1_Init();
+    MX_TIM1_Init();
+    MX_TIM3_Init();
+
+    if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1) != HAL_OK) Error_Handler();
+    if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2) != HAL_OK) Error_Handler();
+    if (HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1) != HAL_OK) Error_Handler();
+    Servo_SetPosition(SERVO_LOCKED_PULSE);
+    GarageServo_Set(GARAGE_SERVO_CLOSE);
+    Fan_SetSpeed(FAN_OFF);
+    Buzzer_Tone(0);
+    DHT22_Init();
+    Keypad_Init();
+    OLED_Init();
+    OLED_Clear();
+
+    RFID_Init();
+    uint8_t rfidVersion = RFID_ReadRegister(REG_VERSION);
+    uint8_t rfidOK = (rfidVersion != 0x00 && rfidVersion != 0xFF);
+
+    char entered[MAX_PASSWORD_LENGTH + 1] = {0};
+    char masked[MAX_PASSWORD_LENGTH + 1] = {0};
+    uint8_t length = 0;
+    char status[22] = "READY";
+    uint32_t lastSensorTick = HAL_GetTick();
+    uint32_t lastDHTTick = 0;
+    uint32_t lastGasBeepTick = 0;
+    uint32_t lastRFIDTick = 0;
+    uint32_t lastDoorUnlockTick = 0;
+    uint32_t garageOpenUntil = 0;
+    uint8_t garageIsOpen = 0;
+    uint8_t doorUnlocked = 0;
+    uint8_t dhtOK = 0;
+    int16_t temperature = 0;
+    uint16_t humidity = 0;
+    uint16_t smoke = 0;
+    uint8_t previousUID[4] = {0};
+    uint8_t havePreviousUID = 0;
+
+    UpdatePasswordArea(masked, "READY");
+    UpdateSensorCorner(temperature, humidity, 0, smoke);
+
+    /* PIR startup stabilization as in the supplied working module. */
+    uint32_t pirStartup = HAL_GetTick();
+    while ((HAL_GetTick() - pirStartup) < 30000U) {
+        uint32_t now = HAL_GetTick();
+        if (now - lastSensorTick >= 500U) {
+            smoke = MQ2_ReadADC();
+            UpdateSensorCorner(temperature, humidity, dhtOK, smoke);
+            lastSensorTick = now;
+        }
+        HAL_Delay(10);
+    }
+
+    while (1)
+    {
+        uint32_t now = HAL_GetTick();
+
+        /* Update DHT22 and fan about every 2 seconds. */
+        if (now - lastDHTTick >= 2000U) {
+            int16_t newT = 0; uint16_t newH = 0;
+            dhtOK = DHT22_Read(&newT, &newH);
+            if (dhtOK) {
+                temperature = newT; humidity = newH;
+                uint16_t duty = FAN_OFF;
+                if (temperature >= (int16_t)TEMP_LIMIT && humidity >= HUM_LIMIT) {
+                    if (temperature >= 310 && humidity >= 900) duty = FAN_HIGH;
+                    else if (temperature >= 280 && humidity >= 850) duty = FAN_MEDIUM;
+                    else duty = FAN_LOW;
+                }
+                Fan_SetSpeed(duty);
+            } else {
+                /* Keep last fan setting if a single DHT read fails. */
+            }
+            lastDHTTick = now;
+        }
+
+        /* MQ-2 and the compact OLED corner reading. */
+        if (now - lastSensorTick >= 500U) {
+            smoke = MQ2_ReadADC();
+            UpdateSensorCorner(temperature, humidity, dhtOK, smoke);
+            if (smoke >= MQ2_THRESHOLD && (now - lastGasBeepTick >= 1000U)) {
+                Buzzer_Tone(1);
+                lastGasBeepTick = HAL_GetTick();
+            } else if (smoke < MQ2_THRESHOLD) {
+                Buzzer_Tone(0);
+            }
+            lastSensorTick = HAL_GetTick();
+        }
+
+        /* Password keypad controls the main door servo on PA8. */
+        char key = Keypad_GetKey();
+        if (key != '\0') {
+            if (key >= '0' && key <= '9') {
+                if (length < MAX_PASSWORD_LENGTH) {
+                    entered[length] = key; length++; entered[length] = '\0';
+                    masked[length - 1] = '*'; masked[length] = '\0';
+                    UpdatePasswordArea(masked, "TYPE # TO CHECK");
+                }
+            } else if (key == '*') {
+                memset(entered, 0, sizeof(entered)); memset(masked, 0, sizeof(masked)); length = 0;
+                UpdatePasswordArea(masked, "CLEARED");
+            } else if (key == '#') {
+                if (strcmp(entered, PASSWORD) == 0) {
+                    Servo_SetPosition(SERVO_UNLOCKED_PULSE);
+                    doorUnlocked = 1; lastDoorUnlockTick = HAL_GetTick();
+                    snprintf(status, sizeof(status), "ACCESS GRANTED");
+                } else {
+                    snprintf(status, sizeof(status), "ACCESS DENIED");
+                }
+                memset(entered, 0, sizeof(entered)); memset(masked, 0, sizeof(masked)); length = 0;
+                UpdatePasswordArea(masked, status);
+            }
+        }
+        if (doorUnlocked && (HAL_GetTick() - lastDoorUnlockTick >= 3000U)) {
+            Servo_SetPosition(SERVO_LOCKED_PULSE);
+            doorUnlocked = 0;
+            UpdatePasswordArea(masked, "DOOR LOCKED");
+        }
+
+        /* PIR + LDR: LED on only if motion is detected AND it is dark.
+           Assumption retained from supplied code: LDR D0 HIGH means dark. */
+        GPIO_PinState ldr = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_15);
+        GPIO_PinState pir = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_1);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8,
+            (ldr == GPIO_PIN_SET && pir == GPIO_PIN_SET) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+
+        /* Close garage after its timed-open interval without blocking other modules. */
+        if (garageIsOpen && (int32_t)(HAL_GetTick() - garageOpenUntil) >= 0) {
+            GarageServo_Set(GARAGE_SERVO_CLOSE);
+            garageIsOpen = 0;
+        }
+
+        /* RFID garage control. Do not update OLED from this subsystem.
+           Authorized UID opens to the tested 2000 us position for 10 seconds;
+           then the existing timeout logic returns it to the tested 1000 us position. */
+        if (rfidOK && (HAL_GetTick() - lastRFIDTick >= 100U)) {
+            uint8_t uid[4];
+            if (RFID_ReadUID(uid)) {
+                uint8_t same = havePreviousUID && memcmp(uid, previousUID, 4) == 0;
+                if (!same) {
+                    memcpy(previousUID, uid, 4); havePreviousUID = 1;
+                    if (uid[0] == RFID_KEY_UID_0 && uid[1] == RFID_KEY_UID_1 && uid[2] == RFID_KEY_UID_2 && uid[3] == RFID_KEY_UID_3) {
+                        GarageServo_Set(GARAGE_SERVO_OPEN);
+                        garageIsOpen = 1;
+                        garageOpenUntil = HAL_GetTick() + GARAGE_OPEN_TIME;
+                    } else if (uid[0] == RFID_CARD_UID_0 && uid[1] == RFID_CARD_UID_1 && uid[2] == RFID_CARD_UID_2 && uid[3] == RFID_CARD_UID_3) {
+                        /* Known unauthorized card: leave garage closed. */
+                    }
+                }
+            } else {
+                havePreviousUID = 0;
+            }
+            lastRFIDTick = HAL_GetTick();
+        }
+        HAL_Delay(10);
+    }
+}
+
+void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef osc = {0}; RCC_ClkInitTypeDef clk = {0};
+    __HAL_RCC_PWR_CLK_ENABLE();
+    __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE2);
+    osc.OscillatorType = RCC_OSCILLATORTYPE_HSI; osc.HSIState = RCC_HSI_ON;
+    osc.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT; osc.PLL.PLLState = RCC_PLL_NONE;
+    if (HAL_RCC_OscConfig(&osc) != HAL_OK) Error_Handler();
+    clk.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+    clk.SYSCLKSource = RCC_SYSCLKSOURCE_HSI; clk.AHBCLKDivider = RCC_SYSCLK_DIV1;
+    clk.APB1CLKDivider = RCC_HCLK_DIV1; clk.APB2CLKDivider = RCC_HCLK_DIV1;
+    if (HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_0) != HAL_OK) Error_Handler();
+}
+
+void Error_Handler(void)
+{
+    __disable_irq();
+    while (1) { }
+}

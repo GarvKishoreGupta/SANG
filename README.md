@@ -20,7 +20,7 @@ The uploaded source files are preserved byte-for-byte with their original filena
 
 - [MESP project report (PDF)](docs/MESP%20Report.pdf): methodology, hardware, system behavior, reported results, limitations, and future work. Uploaded without content changes; its filename is simplified for the repository.
 - [Standalone module guide](docs/standalone-modules.md): wiring, control thresholds, keypad operation, and setup.
-- [Project video folder](videos/): upload the demonstration here. No video has been uploaded yet.
+- [Project demonstration video (MP4)](videos/MESP%20video.mp4): uploaded project recording (18.6 MB). See the [video guide](videos/README.md) for viewing and download links.
 
 The report's integrated-system results are the authors' reported observations; they were not independently reproduced during this repository update. In particular, the report describes retaining the previous fan setting on a failed sensor read, while the standalone DHT22 example switches the fan off.
 

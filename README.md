@@ -19,6 +19,7 @@ The uploaded source files are preserved byte-for-byte with their original filena
 ## Report and demonstration
 
 - [MESP project report (PDF)](docs/MESP%20Report.pdf): methodology, hardware, system behavior, reported results, limitations, and future work. Uploaded without content changes; its filename is simplified for the repository.
+- [Integrated build notes](docs/integrated-build-notes.md): source-specific pin map, project recovery steps, UART limitations, and pending validation.
 - [Standalone module guide](docs/standalone-modules.md): wiring, control thresholds, keypad operation, and setup.
 - [Project demonstration video (MP4)](videos/MESP%20video.mp4): uploaded project recording (18.6 MB). See the [video guide](videos/README.md) for viewing and download links.
 

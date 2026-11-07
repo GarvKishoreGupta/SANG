@@ -40,14 +40,20 @@ static GPIO_PinState HAL_GPIO_ReadPin(GPIO_TypeDef *p, uint16_t pin) {
 }
 /* SCANNER */
 int main(int argc, char **argv) {
-    if(argc!=4) return 2;
+    if(argc!=5) return 2;
     int scenario=atoi(argv[1]);
     uint32_t start=(uint32_t)strtoul(argv[2],NULL,10);
     unsigned step=(unsigned)strtoul(argv[3],NULL,10);
-    for(unsigned t=0;t<1000;t+=step) {
+    unsigned key_index=(unsigned)strtoul(argv[4],NULL,10);
+    if(key_index>=12) return 2;
+    unsigned key_mask=1U<<key_index;
+    /* step=0 selects a deterministic irregular polling schedule. */
+    static const unsigned intervals[]={1,7,2,13,3,5,1,11};
+    unsigned poll=0;
+    for(unsigned t=0;t<1000;) {
         mask=0;
-        if(scenario==1) mask=1; /* hold */
-        if(scenario==2 && (t<200 || t>=400)) mask=1; /* repress */
+        if(scenario==1) mask=key_mask; /* hold */
+        if(scenario==2 && (t<200 || t>=400)) mask=key_mask; /* repress */
         if(scenario==3 && t<16) mask=(t/2)%2; /* brief bounce */
         if(scenario==4) mask=t<24 ? ((t/4)%2) : 1; /* bounce then hold */
         if(scenario==5) mask=t<200 ? 3 : (t<400 ? 1 : (t<600 ? 0 : 1));
@@ -56,6 +62,7 @@ int main(int argc, char **argv) {
         char event=Keypad_GetKey();
         if(calls>5) return 3; /* bounded GPIO work per call */
         if(event) printf("%c %u\n",event,t);
+        t+=step ? step : intervals[poll++ % (sizeof intervals / sizeof intervals[0])];
     }
     return 0;
 }
@@ -75,8 +82,11 @@ class ScannerTests(unittest.TestCase):
             '-std=c99','-Wall','-Wextra','-Werror',str(c),'-o',str(cls.exe)
         ],check=True)
 
-    def events(self, scenario, start=0, step=1):
-        output = subprocess.check_output([str(self.exe),str(scenario),str(start),str(step)],text=True,timeout=5)
+    def events(self, scenario, start=0, step=1, key_index=0):
+        output = subprocess.check_output(
+            [str(self.exe), str(scenario), str(start), str(step), str(key_index)],
+            text=True, timeout=5,
+        )
         return [line.split() for line in output.splitlines()]
 
     def test_idle(self):
@@ -102,6 +112,36 @@ class ScannerTests(unittest.TestCase):
     def test_ten_ms_polling(self):
         events=self.events(2,step=10)
         self.assertEqual([e[0] for e in events], ['1','1'])
+
+    def assert_press_events(self, events, key, repress=False):
+        self.assertEqual([event[0] for event in events],
+                         [key, key] if repress else [key])
+        first_time = int(events[0][1])
+        self.assertGreaterEqual(first_time, 20)
+        self.assertLess(first_time, 200)
+        if repress:
+            self.assertGreaterEqual(int(events[1][1]), 400)
+
+    def test_all_twelve_key_positions(self):
+        for key_index, key in enumerate('123456789*0#'):
+            with self.subTest(key=key):
+                self.assert_press_events(self.events(1, key_index=key_index), key)
+
+    def test_all_keys_release_repress_at_ten_ms(self):
+        for key_index, key in enumerate('123456789*0#'):
+            with self.subTest(key=key):
+                self.assert_press_events(
+                    self.events(2, step=10, key_index=key_index), key, repress=True)
+
+    def test_all_keys_irregular_polling_and_tick_wrap(self):
+        for key_index, key in enumerate('123456789*0#'):
+            for scenario in (1, 2):
+                for start in (0, 0xfffffff0):
+                    with self.subTest(key=key, scenario=scenario, start=start):
+                        self.assert_press_events(
+                            self.events(scenario, start=start, step=0,
+                                        key_index=key_index),
+                            key, repress=scenario == 2)
 
 if __name__=='__main__':
     unittest.main(verbosity=2)

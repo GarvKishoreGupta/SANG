@@ -39,7 +39,7 @@ The new cases assert the expected key identity, exactly one event per press, an 
 
 A GPIO-operation budget checks bounded work in every simulated call. The harness does not provide HAL_Delay, so a newly introduced call to it fails compilation.
 
-Validation status: the original nine tests passed on 6 November 2026 at commit [8558780](https://github.com/GarvKishoreGupta/SANG/commit/8558780d8f60ebb0abd6734937552aa3581c40f8). The expanded harness added on 7 November has **not been compiled or run** because the execution environment was unavailable. Run the entire suite before relying on the new coverage; the earlier pass does not validate this revision.
+Validation status: on 8 November 2026, all twelve test methods passed, including all 72 added subcases, using the exact scanner and harness from commit [b66022d](https://github.com/GarvKishoreGupta/SANG/commit/b66022db23a496ca9738cd81e5c3584637f90c48). The harness compiled with GCC 14.2.0 using `-std=c99 -Wall -Wextra -Werror`. The execution environment had been unavailable on 7 November; this run resolves that host-test gap. These are simulated GPIO/tick checks, not STM32 HAL compilation or hardware validation.
 
 ## Limits and hardware checklist
 

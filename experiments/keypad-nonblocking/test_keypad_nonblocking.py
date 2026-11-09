@@ -58,6 +58,7 @@ int main(int argc, char **argv) {
         if(scenario==4) mask=t<24 ? ((t/4)%2) : 1; /* bounce then hold */
         if(scenario==5) mask=t<200 ? 3 : (t<400 ? 1 : (t<600 ? 0 : 1));
         if(scenario==6) mask=t<300 ? 1 : 2; /* slide without release */
+        if(scenario==7 && t>=50 && t<150) mask=key_mask; /* brief press */
         tick=start+t; calls=0;
         char event=Keypad_GetKey();
         if(calls>5) return 3; /* bounded GPIO work per call */
@@ -142,6 +143,22 @@ class ScannerTests(unittest.TestCase):
                             self.events(scenario, start=start, step=0,
                                         key_index=key_index),
                             key, repress=scenario == 2)
+
+    def test_slow_polling_increases_held_key_latency(self):
+        for key_index, key in enumerate('123456789*0#'):
+            for step in (20, 50, 100):
+                with self.subTest(key=key, step=step):
+                    self.assertEqual(self.events(1, step=step, key_index=key_index),
+                                     [[key, str(8 * step)]])
+
+    def test_slow_polling_can_miss_release(self):
+        # The key is released for 200 ms, but that is less than a 400 ms frame.
+        self.assertEqual(self.events(2, step=100), [['1', '800']])
+
+    def test_press_between_polls_is_missed(self):
+        # The 50..149 ms pulse is detectable at 1 ms, absent at 200 ms polls.
+        self.assertEqual([event[0] for event in self.events(7)], ['1'])
+        self.assertEqual(self.events(7, step=200), [])
 
 if __name__=='__main__':
     unittest.main(verbosity=2)

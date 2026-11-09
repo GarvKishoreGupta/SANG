@@ -29,7 +29,7 @@ python3 experiments/keypad-nonblocking/test_keypad_nonblocking.py
 
 Requirements: Python 3 and a C99 compiler; CC defaults to cc. The test compiles the proposed routine with -Wall -Wextra -Werror against simulated GPIO and ticks.
 
-The suite contains twelve test methods. The original nine cover idle, continuous hold, release/repress, brief bounce, bounce followed by hold, multiple-key lockout, sliding between keys without release, 32-bit tick wrap, and 10 ms polling. Three additional methods define 72 subcases:
+The suite contains fifteen test methods. The original nine cover idle, continuous hold, release/repress, brief bounce, bounce followed by hold, multiple-key lockout, sliding between keys without release, 32-bit tick wrap, and 10 ms polling. Three additional methods define 72 subcases:
 
 - Each of the twelve row/column positions held at 1 ms polling (12 cases).
 - Each key released and pressed again at 10 ms polling (12 cases).
@@ -39,7 +39,26 @@ The new cases assert the expected key identity, exactly one event per press, an 
 
 A GPIO-operation budget checks bounded work in every simulated call. The harness does not provide HAL_Delay, so a newly introduced call to it fails compilation.
 
-Validation status: on 8 November 2026, all twelve test methods passed, including all 72 added subcases, using the exact scanner and harness from commit [b66022d](https://github.com/GarvKishoreGupta/SANG/commit/b66022db23a496ca9738cd81e5c3584637f90c48). The harness compiled with GCC 14.2.0 using `-std=c99 -Wall -Wextra -Werror`. The execution environment had been unavailable on 7 November; this run resolves that host-test gap. These are simulated GPIO/tick checks, not STM32 HAL compilation or hardware validation.
+Three further methods characterize slow polling: all twelve keys at 20, 50 and 100 ms intervals (36 subcases), a release/repress missed at 100 ms polling, and a brief press detected at 1 ms but missed at 200 ms polling.
+
+Validation status: on 9 November 2026, all fifteen test methods passed, including the previous 72 subcases and the 36 slow-polling subcases. The harness compiled with GCC 14.2.0 using `-std=c99 -Wall -Wextra -Werror`. These are simulated GPIO/tick checks, not STM32 HAL compilation or hardware validation.
+
+### Observed slow-polling limits
+
+With a key held from simulated time zero, the first event occurred at:
+
+| Poll interval | First event |
+| --- | --- |
+| 20 ms | 160 ms |
+| 50 ms | 400 ms |
+| 100 ms | 800 ms |
+
+These results were checked for all twelve keys. Each full frame takes four polls; in these cases the candidate is accepted at the second frame boundary.
+
+At 100 ms polling, the supplied release/repress scenario (pressed before 200 ms, released from 200 to 399 ms, pressed again at 400 ms) produces only one event, at 800 ms. The release does not form a stable empty frame. Separately, a press from 50 to 149 ms is detected with 1 ms polling but is entirely missed when calls occur only every 200 ms.
+
+These tests intentionally assert missed-input behavior to characterize a limitation; passing them does not make slow polling acceptable. Integration must establish a suitable maximum interval between calls, including worst-case peripheral work, and verify the intended shortest press/release on hardware. The current source still calls blocking peripheral routines before keypad scanning.
+
 
 ## Limits and hardware checklist
 

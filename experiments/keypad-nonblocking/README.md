@@ -60,6 +60,34 @@ At 100 ms polling, the supplied release/repress scenario (pressed before 200 ms,
 These tests intentionally assert missed-input behavior to characterize a limitation; passing them does not make slow polling acceptable. Integration must establish a suitable maximum interval between calls, including worst-case peripheral work, and verify the intended shortest press/release on hardware. The current source still calls blocking peripheral routines before keypad scanning.
 
 
+## Integrated-loop audit (10 November 2026)
+
+This audit uses [the unchanged integrated source](https://github.com/GarvKishoreGupta/SANG/blob/3c18c8916dcd79a86936fc09ca7bb2eaf26ffb86/alpha%20code.txt). Replacing the keypad routine alone does not bound the interval between calls.
+
+| Work in the integrated source | Evidence and effect on polling |
+| --- | --- |
+| Alarm tone before keypad | `Buzzer_Tone(1)` performs 100 repetitions of two `HAL_Delay(1)` calls: 200 ms of requested delay per tone, plus overhead. |
+| OLED updates before and after keypad | Each command/data byte uses its own blocking I2C transmit with a 100 ms timeout argument. `UpdatePasswordArea` makes 375 such calls: three positioning commands per line, six data calls per character, and lines of 21, 20 and 20 characters. A per-call timeout is not an aggregate refresh deadline. |
+| ADC before keypad | `HAL_ADC_PollForConversion` has a 20 ms timeout argument. Its actual elapsed time depends on conversion and HAL behavior. |
+| DHT22 before keypad | A 2 ms start delay and cycle-counter-based busy waits run about every two seconds. They occupy the foreground while reading. |
+| RFID after keypad | SPI read/write helpers pass `HAL_MAX_DELAY`. The transceive loop's 20,000-iteration limit is not a wall-clock deadline and cannot bound a stalled inner transfer. |
+| Loop pacing | The final `HAL_Delay(10)` is additional to all peripheral work; it does not establish 10 ms polling. |
+| Startup | The 30-second PIR stabilization loop does not call the keypad routine. Treat startup responsiveness separately from normal operation. |
+
+An isolated host check compiled the extracted OLED formatting and buzzer routines with C99, `-Wall -Wextra -Werror`. Counting mocks confirmed 375 OLED command/data calls for a password refresh and 200 ms of requested buzzer delays. The font was stubbed because glyph values do not affect call count. This did not emulate I2C, SPI, ADC, DHT timing, or the complete main loop.
+
+### Proposed integration acceptance criteria
+
+Use a **maximum 10 ms interval between scanner calls as an initial engineering target**, not an achieved specification or a guarantee for every key pulse. The existing 10 ms tests cover selected inputs; they do not prove all onset phases, jitter patterns, or contact bounce.
+
+Before integration:
+
+1. Define the shortest press and release that the product must recognize, then sweep their onset phase and duration in host tests. Do not infer those requirements from the current test fixtures.
+2. Replace the blocking alarm waveform with timer-driven generation, subject to pin/timer availability in the complete project.
+3. Split or queue OLED work and make peripheral operations bounded with explicit error handling. Bound RFID transfers as well as its outer polling loop.
+4. Measure the maximum interval between keypad calls under simultaneous display updates, alarm activity, DHT reads, RFID traffic, and peripheral faults. Record worst-case intervals rather than average loop rate.
+5. Reassess the 10 ms target against the required shortest press/release and hardware measurements. Keep this proposal in draft until the build project and hardware evidence support integration.
+
 ## Limits and hardware checklist
 
 - Debouncing is sampled per complete frame, not continuous observation. Short transitions between samples may be missed.

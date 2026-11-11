@@ -60,6 +60,20 @@ At 100 ms polling, the supplied release/repress scenario (pressed before 200 ms,
 These tests intentionally assert missed-input behavior to characterize a limitation; passing them does not make slow polling acceptable. Integration must establish a suitable maximum interval between calls, including worst-case peripheral work, and verify the intended shortest press/release on hardware. The current source still calls blocking peripheral routines before keypad scanning.
 
 
+### Press-duration and onset-phase sweep (11 November 2026)
+
+Run `python3 experiments/keypad-nonblocking/phase_sweep.py` to reproduce a diagnostic sweep using the existing C harness and unchanged scanner. At fixed 10 ms polling, it varies all twelve keys, onset times 0 through 39 ms, and three press durations (1,440 combinations). Each case starts a fresh scanner process; this covers cold-start single presses, not steady-state repeated input.
+
+| Press duration | Cases | No event | Event at/after release | Event latency from onset |
+| --- | --- | --- | --- | --- |
+| 50 ms | 480 | 363 | 90 | 41–79 ms |
+| 100 ms | 480 | 0 | 30 | 41–109 ms |
+| 200 ms | 480 | 0 | 0 | 41–109 ms |
+
+Latency ranges include only cases producing events. Late events are a subset of detected events, not an additional failure count. These results were reproduced on 11 November with C99 warnings treated as errors; the existing fifteen test methods also passed.
+
+A row sample can remain in the accumulated frame after the physical key has been released. For example, key `1` pressed at 11 ms and released at 111 ms produces an event at 120 ms. Thus “event after debounced press” describes sampled behavior, not proof that the contact is still held at event delivery. The sweep deliberately reports this limitation without declaring these timings acceptable. It does not model bounce, electrical effects, varying poll intervals, or releases between repeated presses.
+
 ## Integrated-loop audit (10 November 2026)
 
 This audit uses [the unchanged integrated source](https://github.com/GarvKishoreGupta/SANG/blob/3c18c8916dcd79a86936fc09ca7bb2eaf26ffb86/alpha%20code.txt). Replacing the keypad routine alone does not bound the interval between calls.

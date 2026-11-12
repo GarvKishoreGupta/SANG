@@ -74,6 +74,20 @@ Latency ranges include only cases producing events. Late events are a subset of 
 
 A row sample can remain in the accumulated frame after the physical key has been released. For example, key `1` pressed at 11 ms and released at 111 ms produces an event at 120 ms. Thus “event after debounced press” describes sampled behavior, not proof that the contact is still held at event delivery. The sweep deliberately reports this limitation without declaring these timings acceptable. It does not model bounce, electrical effects, varying poll intervals, or releases between repeated presses.
 
+### Repeated-press sweep (12 November 2026)
+
+The same `phase_sweep.py` command now also checks two 200 ms presses of the same key. It varies all twelve keys and initial onset times 0–39 ms at fixed 10 ms polling, with three release gaps. Each of the 1,440 added cases starts a fresh process but retains scanner state between the two presses.
+
+| Release gap | Cases | One event | Two events |
+| --- | --- | --- | --- |
+| 50 ms | 480 | 360 | 120 |
+| 100 ms | 480 | 0 | 480 |
+| 200 ms | 480 | 0 | 480 |
+
+No case produced zero events, more than two events, or an incorrect key identity. With a short release, the scanner may not observe a stable empty frame long enough to rearm, so the second press is suppressed. The 100 ms result is specific to these inputs and polling phase sweep; it is not a universal minimum release specification.
+
+On 12 November, the full diagnostic completed all 2,880 single/repeated-press cases with C99 warnings treated as errors, and all fifteen existing unit test methods passed. An initial generated-C indentation warning was corrected before these results were recorded. No scanner implementation changed. Arbitrary-length sequences, different consecutive keys, bounce, jitter and hardware behavior remain outside this diagnostic.
+
 ## Integrated-loop audit (10 November 2026)
 
 This audit uses [the unchanged integrated source](https://github.com/GarvKishoreGupta/SANG/blob/3c18c8916dcd79a86936fc09ca7bb2eaf26ffb86/alpha%20code.txt). Replacing the keypad routine alone does not bound the interval between calls.

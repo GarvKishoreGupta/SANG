@@ -1,0 +1,53 @@
+name: Keypad host checks
+
+on:
+  pull_request:
+    paths:
+      - 'experiments/keypad-nonblocking/**'
+      - '.github/workflows/keypad-host.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'experiments/keypad-nonblocking/**'
+      - '.github/workflows/keypad-host.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: keypad-host-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  keypad-host:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    defaults:
+      run:
+        shell: bash
+    env:
+      CC: gcc
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Record host tools
+        run: |
+          python3 --version
+          gcc --version
+      - name: Run host unit tests
+        run: python3 experiments/keypad-nonblocking/test_keypad_nonblocking.py
+      - name: Report timing diagnostic
+        run: |
+          python3 experiments/keypad-nonblocking/phase_sweep.py | tee phase_sweep.jsonl
+          cat >> "$GITHUB_STEP_SUMMARY" <<'MARKDOWN'
+          ## Sampled keypad timing
+          These are simulated GPIO/tick results, not STM32 or hardware validation.
+          The diagnostic reports missed presses and late events; successful completion
+          does not mean those timings meet product requirements.
+          
+          ```json
+          MARKDOWN
+          cat phase_sweep.jsonl >> "$GITHUB_STEP_SUMMARY"
+          printf '\n```\n' >> "$GITHUB_STEP_SUMMARY"

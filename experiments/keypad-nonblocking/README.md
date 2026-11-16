@@ -43,6 +43,14 @@ Three further methods characterize slow polling: all twelve keys at 20, 50 and 1
 
 Validation status: on 9 November 2026, all fifteen test methods passed, including the previous 72 subcases and the 36 slow-polling subcases. The harness compiled with GCC 14.2.0 using `-std=c99 -Wall -Wextra -Werror`. These are simulated GPIO/tick checks, not STM32 HAL compilation or hardware validation.
 
+### Continuous integration
+
+[Keypad host checks](../../.github/workflows/keypad-host.yml) runs the existing unit tests and timing diagnostic for pull requests that change this experiment or its workflow, and for matching pushes to `main`. It uses Ubuntu 24.04, Python 3 and GCC, records tool versions, and compiles the harness with the existing C99 warning flags. The timing results appear in the workflow logs and job summary.
+
+A green workflow means the host assertions passed and the diagnostic completed. It does **not** mean missed presses or late events are acceptable, and does not validate STM32 HAL integration, electrical behavior, or hardware timing. The workflow has read-only repository permissions and does not deploy or modify firmware.
+
+Before adding this workflow on 16 November 2026, all fifteen unit-test methods passed locally with GCC 14.2.0, and all 2,880 diagnostic cases reproduced the results in the tables below. These local results do not establish that a GitHub-hosted run has completed.
+
 ### Observed slow-polling limits
 
 With a key held from simulated time zero, the first event occurred at:
